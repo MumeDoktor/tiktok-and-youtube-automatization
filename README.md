@@ -1,70 +1,85 @@
-# Getting Started with Create React App
+# TikTok Agent Control
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+Two TikTok accounts, one agent each. Every agent tracks its account's
+analytics, researches its niche, and plans videos inside a content format you
+define — on a schedule derived from that account's own performance data. You
+talk to each agent in its own chat, and what you tell it there sticks.
 
-## Available Scripts
+Read-only by default: the agents observe and plan, and cannot post. Uploading
+and publishing are opt-in levels you can enable later.
 
-In the project directory, you can run:
+Built for a US audience. Runs locally; lifts to a VPS unchanged.
 
-### `npm start`
+## Stack
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
+Next.js 15 (App Router) · SQLite + Drizzle · Claude Opus 5 / Sonnet 5 ·
+yt-dlp · ffmpeg
 
-The page will reload when you make changes.\
-You may also see any lint errors in the console.
+## Quick start
 
-### `npm test`
+```bash
+npm install
+npm run db:push      # create tables
+npm run db:seed      # create 2 accounts + 2 agents
+npm run dev          # dashboard  -> http://localhost:3000
+npm run worker       # autonomous loop (second terminal)
+```
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+Full instructions, including how to get TikTok API access:
+**[SETUP.md](./SETUP.md)**
 
-### `npm run build`
+## How it works
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+```
+                 ┌──────────────── worker loop ────────────────┐
+                 │                                             │
+  every 3h   ──▶ refresh_metrics ──▶ TikTok API ──▶ snapshots  │
+  daily      ──▶ analyze_market  ──▶ Opus 5 + web search       │
+  daily      ──▶ plan_content    ──▶ Opus 5 ──▶ posts + slots  │
+                        │                                      │
+                        ▼                                      │
+                   source_video ──▶ yt-dlp   ──▶ content_item  │
+                        ▼                                      │
+                   edit_video   ──▶ ffmpeg   ──▶ 1080x1920 mp4 │
+                        ▼                                      │
+                   publish      ──▶ TikTok Content Posting API │
+                 │                                             │
+                 └─────────────────────────────────────────────┘
+```
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
+Every step is a row in `jobs` with retries and exponential backoff, so a failed
+download or a TikTok hiccup never wedges the pipeline.
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+## Agent memory
 
-### `npm run eject`
+Three layers, all injected on every agent call — chat and autonomous runs alike:
 
-**Note: this is a one-way operation. Once you `eject`, you can't go back!**
+1. **Content profile** — the format you defined. Binding; the agent picks topics
+   inside it and never changes it.
+2. **Standing memory** — durable directives distilled out of your chats
+   automatically. Say "stop using trending audio" once and it holds.
+3. **Live data** — current metrics, recent post performance, latest market read.
 
-If you aren't satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+Raw chat history replays verbatim on top of that, so the agent is aware of both
+the detail of recent conversations and the substance of old ones.
 
-Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you're on your own.
+## Autonomy levels
 
-You don't have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn't feel obligated to use this feature. However we understand that this tool wouldn't be useful if you couldn't customize it when you are ready for it.
+| Level | Behaviour | Touches TikTok? |
+|---|---|---|
+| `observe` | Analytics, market analysis, content plans, chat | read only |
+| `suggest` | Also downloads and edits the video, leaving the file for you | read only |
+| `draft` | Uploads as a private draft — you tap post | needs `video.upload` |
+| `full` | Publishes publicly, unattended | needs audit |
 
-## Learn More
+Accounts start on `observe`, and the app requests **read-only scopes by
+default** — so it can see your accounts and cannot post to them.
 
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
+## Safety rails
 
-To learn React, check out the [React documentation](https://reactjs.org/).
-
-### Code Splitting
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/code-splitting](https://facebook.github.io/create-react-app/docs/code-splitting)
-
-### Analyzing the Bundle Size
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size](https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size)
-
-### Making a Progressive Web App
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app)
-
-### Advanced Configuration
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/advanced-configuration](https://facebook.github.io/create-react-app/docs/advanced-configuration)
-
-### Deployment
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/deployment](https://facebook.github.io/create-react-app/docs/deployment)
-
-### `npm run build` fails to minify
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify](https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify)
+- Clips download with `rightsStatus = "unverified"`; publishing refuses them
+  until you assert you hold the rights.
+- Autonomy cannot be set above what TikTok actually granted. With read-only
+  scopes, `draft` and `full` are refused by both the UI and the API.
+- The agent is instructed to report numbers only from live data, and to say when
+  it does not have something rather than guess.

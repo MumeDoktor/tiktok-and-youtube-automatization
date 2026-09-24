@@ -2,38 +2,50 @@
   "name": "tik_tok_content_creator",
   "version": "0.1.0",
   "private": true,
-  "dependencies": {
-    "@testing-library/dom": "^10.4.1",
-    "@testing-library/jest-dom": "^6.9.1",
-    "@testing-library/react": "^16.3.2",
-    "@testing-library/user-event": "^13.5.0",
-    "react": "^19.2.6",
-    "react-dom": "^19.2.6",
-    "react-scripts": "5.0.1",
-    "web-vitals": "^2.1.4"
-  },
   "scripts": {
-    "start": "react-scripts start",
-    "build": "react-scripts build",
-    "test": "react-scripts test",
-    "eject": "react-scripts eject"
+    "dev": "tsx src/scripts/start.ts",
+    "build": "next build",
+    "start": "next start",
+    "db:push": "drizzle-kit push",
+    "db:studio": "drizzle-kit studio",
+    "db:seed": "tsx src/db/seed.ts",
+    "worker": "tsx src/worker/index.ts",
+    "doctor": "tsx src/scripts/doctor.ts",
+    "hunt": "tsx src/scripts/hunt.ts",
+    "verify": "tsx src/scripts/verify.ts",
+    "probe:socialcrawl": "tsx src/scripts/probe-socialcrawl.ts",
+    "sync": "tsx src/scripts/sync.ts",
+    "probe:dvids": "tsx src/scripts/probe-dvids.ts",
+    "probe:tts": "tsx src/scripts/probe-tts.ts",
+    "probe:edit": "tsx src/scripts/probe-edit.ts",
+    "probe:quality": "tsx src/scripts/probe-quality.ts",
+    "probe:transitions": "tsx src/scripts/probe-transitions.ts",
+    "probe:effects": "tsx src/scripts/probe-effects.ts",
+    "dev:web": "next dev",
+    "probe:edit2": "tsx src/scripts/probe-edit2.ts",
+    "phone:doctor": "python src/lib/tiktok_phone.py doctor",
+    "phone:inspect": "python src/lib/tiktok_phone.py inspect"
   },
-  "eslintConfig": {
-    "extends": [
-      "react-app",
-      "react-app/jest"
-    ]
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.120.0",
+    "better-sqlite3": "^12.2.0",
+    "date-fns": "^4.1.0",
+    "drizzle-orm": "^0.44.2",
+    "lucide-react": "^0.545.0",
+    "next": "^15.5.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zod": "^4.1.5"
   },
-  "browserslist": {
-    "production": [
-      ">0.2%",
-      "not dead",
-      "not op_mini all"
-    ],
-    "development": [
-      "last 1 chrome version",
-      "last 1 firefox version",
-      "last 1 safari version"
-    ]
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.13",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "drizzle-kit": "^0.31.4",
+    "tailwindcss": "^4.1.13",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.2"
   }
 }
