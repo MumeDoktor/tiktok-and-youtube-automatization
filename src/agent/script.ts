@@ -2,7 +2,7 @@ import { desc, eq } from "drizzle-orm";
 import type Anthropic from "@anthropic-ai/sdk";
 import { db } from "@/db";
 import { accounts, contentProfiles, posts } from "@/db/schema";
-import { anthropic } from "@/lib/anthropic";
+import { subscriptionMessagesCreate } from "@/lib/claude-subscription";
 import { MODELS } from "@/lib/env";
 import { normaliseLook, type EffectHit, type Look } from "@/lib/look";
 import type { ScriptLine } from "@/lib/tts";
@@ -15,12 +15,21 @@ import { latestAnalysis } from "./account-analysis";
  * Aims at the middle of the window the edit needs going in: a narrator speaks
  * at about two and a half words a second including pauses.
  */
-function narrationLength(): string {
-  const { minSec, maxSec } = sourceWindowSec();
+function lineBudget(accountId?: string): { sec: number; words: number; minLines: number; maxLines: number } {
+  const { minSec, maxSec } = sourceWindowSec(accountId);
   const sec = Math.round((minSec + maxSec) / 2);
-  const words = Math.round(sec * 2.4);
+  return {
+    sec,
+    words: Math.round(sec * 2.4),
+    minLines: Math.max(4, Math.round(sec / 4.5)),
+    maxLines: Math.max(5, Math.round(sec / 3.5)),
+  };
+}
+
+function narrationLength(accountId?: string): string {
+  const { sec, words, minLines, maxLines } = lineBudget(accountId);
   return (
-    `- ${Math.max(4, Math.round(sec / 4.5))}-${Math.max(5, Math.round(sec / 3.5))} lines and about ${words} words IN TOTAL. ` +
+    `- ${minLines}-${maxLines} lines and about ${words} words IN TOTAL. ` +
     `The narrator speaks at roughly two and a half words a second, so ${words} words plus pauses lands at about ${sec} seconds - ` +
     `the length the owner wants. Anything much longer is cut.`
   );
@@ -46,7 +55,7 @@ const WRITE_TOOL: Anthropic.Tool = {
       lines: {
         type: "array",
         description:
-          "The narration, one sentence per entry, in order. 10-13 entries, and 110 words across ALL of them put together. Each is spoken aloud by a synthetic narrator, so keep them short and declarative - long subordinate clauses read flat.",
+          "The narration, one sentence per entry, in order - as many entries and words as the request's length rule states, counted across ALL of them. Each is spoken aloud by a synthetic narrator, so keep them short and declarative - long subordinate clauses read flat.",
         items: {
           type: "object",
           properties: {
@@ -74,7 +83,7 @@ const WRITE_TOOL: Anthropic.Tool = {
       caption: {
         type: "string",
         description:
-          "The TikTok caption. MAXIMUM 80 CHARACTERS. This account's biggest videos have captions of about 40 characters. The story is in the narration, not here.",
+          "The TikTok caption. MAXIMUM 80 CHARACTERS. Not a label and not the story: one question or disputed claim about this incident that a viewer would answer in the comments. Comments and shares are what carry a video past its first few hundred viewers, and a caption that only names the event gives nobody anything to say.",
       },
       hashtags: {
         type: "array",
@@ -284,7 +293,7 @@ export async function writeScript(
     }
   }
 
-  const response = await anthropic().messages.create({
+  const response = await subscriptionMessagesCreate({
     model: MODELS.strategy,
     max_tokens: 4000,
     thinking: { type: "adaptive" },
@@ -330,7 +339,7 @@ export async function writeScript(
             : "",
           "",
           "Write the narration. Requirements:",
-          narrationLength(),
+          narrationLength(accountId),
           "",
           "RETENTION. This is the part that decides whether the video works:",
           "- The first line plants a question and does NOT answer it. State the openLoop field first, then write an opening that makes the viewer need that answer.",
@@ -348,7 +357,8 @@ export async function writeScript(
           "It failed for three reasons: the hook and the first line said the same thing so the premise was spent in two seconds, the middle was context rather than escalation, and the payoff was wordplay instead of an answer. The one genuinely interesting fact - that the ships which SURVIVED were the real problem - arrived at thirty seconds, long after everyone had gone. That fact should have been the question planted at the start.",
           "",
           "- Never state a fact you were not given. If you need a detail the footage description does not supply, write around it.",
-          "- The caption is a label, not the story. Keep it under 80 characters.",
+          "- The caption is not the story. It is one question or disputed claim a viewer would answer in the comments, under 80 characters - never just the event's name and year.",
+          "- If one closing line follows the payoff, make it the thing people will argue about: who was to blame, whether it was worth it, what should have happened. Stated, not asked.",
           agreed?.hookText
             ? "- The owner agreed to the direction above. Stay on that story. Sharpen the wording if the footage supports something better, but do not switch to a different subject."
             : "",
@@ -366,9 +376,34 @@ export async function writeScript(
 
   const raw = block.input as Script & { look: unknown };
   let lines = (raw.lines ?? [])
-    .filter((l) => l && typeof l.text === "string" && l.text.trim().length > 0)
-    .slice(0, 18);
+    .filter((l) => l && typeof l.text === "string" && l.text.trim().length > 0);
   if (lines.length === 0) throw new Error("The agent returned an empty script.");
+
+  // Over-long scripts lose MIDDLE escalations, never the ending.
+  //
+  // This was a flat `.slice(0, 18)`, sized for 30-second clips. A 70-90 second
+  // story legitimately runs past eighteen lines, so the slice cut the turn and
+  // the payoff off the end: a Cuban Missile Crisis script planted "did the
+  // captain fire?" and stopped on "His name was Vasili Arkhipov" - a video
+  // that never answers its own question. Same rule as trimToBudget: open, turn
+  // and payoff carry the shape; an escalation carries one fact.
+  const cap = lineBudget(accountId).maxLines + 3;
+  while (lines.length > cap) {
+    const mid = lines.length / 2;
+    let victim = -1;
+    for (let i = 1; i < lines.length; i++) {
+      if (lines[i].intent !== "escalate") continue;
+      if (victim < 0 || Math.abs(i - mid) < Math.abs(victim - mid)) victim = i;
+    }
+    if (victim < 0) break;
+    lines = lines.filter((_, i) => i !== victim);
+  }
+
+  // A script that plants a question and never answers it is not a video.
+  // Refused here, loudly, rather than voiced and rendered for nothing.
+  if (!lines.some((l) => l.intent === "payoff")) {
+    throw new Error("The script never answers its own question - no payoff line. Nothing was voiced.");
+  }
 
   // Everything after the payoff is dilution. One closing line can land well;
   // a run of them spends the answer and then keeps talking, which is how a

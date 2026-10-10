@@ -3,6 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { eq } from "drizzle-orm";
+import { db } from "@/db";
+import { settings } from "@/db/schema";
 import { env } from "./env";
 import { mediaDir } from "./media";
 
@@ -89,8 +92,29 @@ export function aeBridgeAlive(): boolean {
  * everything is not a cut" - so the target has to sit under the source's own
  * length, or a segment this app already chose tightly would fail outright.
  */
-export function aeTargetSec(sourceSec: number): number {
-  return Math.max(8, Math.min(env.clipMaxSec, Math.round(sourceSec * AE_KEEP)));
+export function aeTargetSec(sourceSec: number, accountId?: string): number {
+  return Math.max(8, Math.min(clipLengths(accountId).maxSec, Math.round(sourceSec * AE_KEEP)));
+}
+
+/**
+ * The finished-video length window for one account.
+ *
+ * CLIP_MIN_SEC/CLIP_MAX_SEC set it for everyone; an account can override it in
+ * the settings table (`clip_min_sec:<accountId>`, `clip_max_sec:<accountId>`).
+ * They differ in kind, not taste: a monetized account earns nothing under a
+ * minute, while a repost account's audience leaves past fifty seconds.
+ */
+export function clipLengths(accountId?: string): { minSec: number; maxSec: number } {
+  const read = (key: string) => {
+    if (!accountId) return null;
+    const row = db.select().from(settings).where(eq(settings.key, `${key}:${accountId}`)).get();
+    const n = row ? Number(row.value) : NaN;
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+  return {
+    minSec: read("clip_min_sec") ?? env.clipMinSec,
+    maxSec: read("clip_max_sec") ?? env.clipMaxSec,
+  };
 }
 
 /** How much of what it is given the editor is asked to keep - see aeTargetSec. */
@@ -104,15 +128,16 @@ const AE_KEEP = 0.85;
  * Effects cuts to a share of it and then lands a little under, so it needs
  * more going in - an 8 second segment came out as a 4.9 second video.
  */
-export function sourceWindowSec(): { minSec: number; maxSec: number } {
-  if (!useAeEditor()) return { minSec: env.clipMinSec, maxSec: env.clipMaxSec };
+export function sourceWindowSec(accountId?: string): { minSec: number; maxSec: number } {
+  const len = clipLengths(accountId);
+  if (!useAeEditor()) return len;
   return {
-    minSec: Math.ceil(env.clipMinSec / AE_KEEP) + 2,
+    minSec: Math.ceil(len.minSec / AE_KEEP) + 2,
     // Generous at the top on purpose. The editor cuts its target out of
     // whatever it is given, so a story that takes a minute to tell is usable -
     // and a tight ceiling here throws those away before anyone hears them,
     // which is most of what "nothing worth cutting" used to mean.
-    maxSec: Math.round(env.clipMaxSec * 2.5),
+    maxSec: Math.round(len.maxSec * 2.5),
   };
 }
 
@@ -253,6 +278,18 @@ export async function runAeEditor(opts: {
   sourcePath: string;
   targetSec: number;
   musicPath?: string | null;
+  /** Edit every span as given - the source is already the story (a narrated pre-cut, a finished short). */
+  keepAll?: boolean;
+  /** The source already carries captions and titles: add motion only. */
+  motionOnly?: boolean;
+  /** How much the editor adds relative to the reference rate; 1.8 is noticeably busier. */
+  appetite?: number;
+  /** The narration as written. Whisper keeps the timing; the words come from here. */
+  script?: string | null;
+  /** The music bed's level in dB; the editor's default is -16. */
+  musicDb?: number;
+  /** Spans the owner's review cut out (only honoured with keepAll). */
+  dropSpans?: number[];
   onProgress: (message: string) => void;
 }): Promise<AeOutcome> {
   const runDir = aeRunDir(opts.clipId);
@@ -269,6 +306,16 @@ export async function runAeEditor(opts: {
     `--target=${opts.targetSec}`,
   ];
   if (opts.musicPath) args.push(`--music=${path.resolve(opts.musicPath)}`);
+  if (opts.keepAll) args.push("--keep-all");
+  if (opts.motionOnly) args.push("--motion-only");
+  if (opts.appetite && opts.appetite !== 1) args.push(`--appetite=${opts.appetite}`);
+  if (opts.musicDb !== undefined) args.push(`--music-db=${opts.musicDb}`);
+  if (opts.dropSpans?.length) args.push(`--drop-spans=${opts.dropSpans.join(",")}`);
+  if (opts.script?.trim()) {
+    const scriptFile = path.join(runDir, "script.txt");
+    fs.writeFileSync(scriptFile, opts.script.trim(), "utf8");
+    args.push(`--script=${scriptFile}`);
+  }
 
   const tail: string[] = [];
   const startedAt = Date.now();

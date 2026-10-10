@@ -20,9 +20,15 @@ import { makeClip } from "../agent/clip";
 import { makeDvidsClip } from "../agent/footage";
 import { produceForSlot, produceNext, producePodcastClips, reportProduced } from "../agent/produce";
 import { collectAeExports, editInAe, exportInAe, type AeEditPayload } from "../agent/ae-edit";
+import { editInCodex, type CodexEditPayload } from "../agent/codex-edit";
 import { fixedSlots, hourLabel, planAutopilot, readAutopilotPayload } from "../agent/autopilot";
 import { publishClip, reportPublishGaveUp, type PublishPayload } from "../agent/publish";
+import { handoffClipToClaude } from "../lib/claude-handoff";
+import { makeVideo } from "../agent/make";
 import { aeEditorDir, useAeEditor } from "../lib/ae-editor";
+import { pollTelegram, telegramStatus } from "../agent/telegram-review";
+import { reviseInAe, type RevisePayload } from "../agent/revise";
+import { checkComments, checkCommentsBeforeVideo, sendReplies } from "../agent/comments";
 
 type JobRow = typeof jobs.$inferSelect;
 
@@ -104,18 +110,47 @@ async function runJob(job: JobRow) {
     case "edit_ae":
       await editInAe(accountId, JSON.parse(job.payload) as AeEditPayload);
       return;
+    case "revise_ae":
+      await reviseInAe(accountId, JSON.parse(job.payload) as RevisePayload);
+      return;
+    case "edit_codex":
+      await editInCodex(accountId, JSON.parse(job.payload) as CodexEditPayload);
+      return;
     case "export_ae":
       await exportInAe(accountId, JSON.parse(job.payload) as { clipId: string });
       return;
     case "publish_phone":
+      if (env.publishBackend === "claude") {
+        await handoffClipToClaude(accountId, (JSON.parse(job.payload) as PublishPayload).clipId);
+      } else {
+        await publishClip(accountId, JSON.parse(job.payload) as PublishPayload);
+      }
+      return;
+    case "handoff_claude":
+      await handoffClipToClaude(accountId, (JSON.parse(job.payload) as PublishPayload).clipId);
+      return;
+    case "make_video":
+      await makeVideo(accountId);
+      return;
+    case "post_now":
+      // Always the direct, verified phone driver - an approval means post it
+      // now, to the clip's own account, not hand it on.
       await publishClip(accountId, JSON.parse(job.payload) as PublishPayload);
       return;
     case "autopilot": {
       const payload = readAutopilotPayload(job);
       if (!payload) throw new Error(`Job ${job.id} has no slot`);
+      // The phone is free until the video is made: read the comments first.
+      if (Date.now() < payload.slotAt) await checkCommentsBeforeVideo(accountId);
       await produceForSlot(accountId, payload);
       return;
     }
+    case "check_comments":
+      await checkComments(accountId);
+      return;
+    case "reply_comments":
+      await sendReplies(accountId);
+      return;
     default:
       throw new Error(`Unknown job type ${job.type}`);
   }
@@ -123,13 +158,12 @@ async function runJob(job: JobRow) {
 
 /** Claims and runs at most one due job. Returns true if it ran something. */
 async function tick(): Promise<boolean> {
-  const job = db
-    .select()
-    .from(jobs)
-    .where(and(eq(jobs.status, "queued"), lte(jobs.runAt, new Date())))
-    .orderBy(asc(jobs.runAt))
-    .limit(1)
-    .get();
+  const due = and(eq(jobs.status, "queued"), lte(jobs.runAt, new Date()));
+  // An approved video jumps the queue: Approve means post it now, not after
+  // whatever builds and syncs autopilot queued earlier.
+  const job =
+    db.select().from(jobs).where(and(due, eq(jobs.type, "post_now"))).orderBy(asc(jobs.runAt)).limit(1).get() ??
+    db.select().from(jobs).where(due).orderBy(asc(jobs.runAt)).limit(1).get();
 
   if (!job) return false;
 
@@ -160,11 +194,16 @@ async function tick(): Promise<boolean> {
       .where(eq(jobs.id, job.id))
       .run();
 
-    if (giveUp && job.type === "publish_phone") reportPublishGaveUp(job.accountId, message);
+    const publish = job.type === "publish_phone" || job.type === "handoff_claude" || job.type === "post_now";
+    if (giveUp && publish) {
+      reportPublishGaveUp(job.accountId, message, job.type === "handoff_claude" || env.publishBackend === "claude");
+    }
 
     logEvent({
       accountId: job.accountId,
       level: giveUp ? "error" : "warn",
+      // A post that gave up was just reported above, in its own words.
+      ...(giveUp && publish ? { telegram: false } : {}),
       type: `job.${job.type}.${giveUp ? "failed" : "retry"}`,
       message: giveUp
         ? `${job.type} failed after ${attempts} attempts: ${message}`
@@ -197,12 +236,25 @@ async function main() {
     `  autopilot:     ${slots} where switched on, started ${env.autopilotLeadMinutes}min before each slot`,
   );
   console.log(
-    `  publishing:    ${env.phonePublish ? `through the phone${env.phoneDryRun ? " (DRY RUN - stops before Post)" : ""}` : "off (set PHONE_PUBLISH=on)"}`,
+    `  publishing:    ${env.phonePublish ? env.publishBackend === "claude" ? "handoff to Claude after render" : `phone driver${env.phoneDryRun ? " (DRY RUN - stops before Post)" : ""}` : "off (set PHONE_PUBLISH=on)"}`,
   );
   console.log(`  ae export:     ${env.aeAutoExport ? "automatic" : "after your review"}`);
-  console.log(`  anthropic key: ${env.anthropicApiKey ? "set" : "MISSING"}`);
+  console.log(`  claude:        your subscription (paid API ${process.env.PAID_API === "on" ? "ON - bills ANTHROPIC_API_KEY" : "off"})`);
   console.log(`  socialcrawl:   ${env.socialCrawlKey ? "set" : "MISSING"}`);
-  console.log(`  editor:        ${useAeEditor() ? `After Effects (${aeEditorDir})` : "Remotion"}`);
+  console.log(`  editor:        ${env.editorBackend === "codex" ? "Codex audio-first" : useAeEditor() ? `After Effects (${aeEditorDir})` : "Remotion"}`);
+  console.log(`  telegram:      ${telegramStatus()}`);
+  console.log(
+    `  comments:      ${env.commentReplies === "off" || !env.phonePublish ? "off" : `read before each autopilot video, replies ${env.commentReplies === "auto" ? "sent automatically" : "sent after your OK in Telegram"}`}`,
+  );
+
+  logEvent({
+    type: "worker.started",
+    message: `Worker started - videos export ${env.aeAutoExport ? "on their own" : "after a review in After Effects"}, comment replies: ${env.commentReplies}.`,
+  });
+
+  // Its own timer, not the job loop: an Approve pressed during a half-hour
+  // After Effects build should still be taken within seconds.
+  const phone = setInterval(() => void pollTelegram(), 3_000);
 
   // Recover jobs that were mid-flight when the process last died.
   const stuck = db
@@ -227,6 +279,7 @@ async function main() {
     await new Promise((r) => setTimeout(r, env.workerIntervalMs));
   }
 
+  clearInterval(phone);
   console.log("Worker stopped.");
   process.exit(0);
 }

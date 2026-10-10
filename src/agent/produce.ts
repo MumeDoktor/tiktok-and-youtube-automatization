@@ -1,8 +1,8 @@
 import { and, desc, eq, ne } from "drizzle-orm";
 import type Anthropic from "@anthropic-ai/sdk";
 import { db } from "@/db";
-import { accounts, clips, contentProfiles, posts } from "@/db/schema";
-import { anthropic } from "@/lib/anthropic";
+import { accounts, clips, contentProfiles, posts, settings } from "@/db/schema";
+import { subscriptionMessagesCreate } from "@/lib/claude-subscription";
 import { env, MODELS } from "@/lib/env";
 import { latestAnalysis, loadVideos, computeStats } from "./account-analysis";
 import { formatSlot, type AutopilotPayload } from "./autopilot";
@@ -12,6 +12,8 @@ import { schedulePublish } from "./publish";
 import { makeDvidsClip } from "./footage";
 import { makeClip } from "./clip";
 import { findSource, type SourceHint } from "./source";
+import { recentRejections } from "./revise";
+import { libraryDir, libraryShare, makeLibraryClip } from "./library";
 
 /* ------------------------------------------------------------------ */
 /* Deciding what to make                                               */
@@ -26,7 +28,7 @@ const DECIDE_TOOL: Anthropic.Tool = {
     properties: {
       format: {
         type: "string",
-        enum: ["interview", "archive"],
+        enum: env.editorBackend === "codex" ? ["interview"] : ["interview", "archive"],
         description:
           "Where the video comes from. interview: a clip cut from a long YouTube interview or podcast, in the speaker's own voice - the only way to get a named person telling their story. archive: narration written over public-domain footage - only for a story that the archive's footage can actually show.",
       },
@@ -38,7 +40,7 @@ const DECIDE_TOOL: Anthropic.Tool = {
       searchTerms: {
         type: "string",
         description:
-          "For interview: what you would type into YouTube to find a long interview where this story is told, e.g. 'John McPhee Delta Force podcast'. For archive: what is ON SCREEN, not the narrative, e.g. 'B-29 bomber takeoff 1945'.",
+          "For interview: what you would type into YouTube to find a long interview where this story is told, e.g. 'John McPhee Delta Force podcast'. For archive: what is ON SCREEN, not the narrative - several short searches of 2-3 words each, separated by ';', e.g. 'B-29 bomber takeoff; atomic test Nevada; soldiers foxhole'. The archive matches every word of a search, and its films are catalogued by subject, not by incident, so an operation's name or a long phrase finds nothing.",
       },
       why: {
         type: "string",
@@ -92,6 +94,25 @@ export type Decision = {
  * Everything it cites is measured from the account, so the justification the
  * owner reads is checkable rather than plausible-sounding.
  */
+/**
+ * The decision tool, limited to the formats this account may use.
+ *
+ * Set per account in the settings table as `formats:<accountId>` (e.g.
+ * "archive"). A monetized account must only get ORIGINAL narrated videos -
+ * an interview cut is someone else's footage, which Creator Rewards does not
+ * pay for - so for it "interview" is not an option to be argued out of; it is
+ * not on the menu.
+ */
+function decideToolFor(accountId: string): Anthropic.Tool {
+  const row = db.select().from(settings).where(eq(settings.key, `formats:${accountId}`)).get();
+  const base = (DECIDE_TOOL.input_schema as { properties: { format: { enum: string[] } } }).properties.format.enum;
+  const allowed = row ? row.value.split(",").map((f) => f.trim()).filter((f) => base.includes(f)) : base;
+  if (!allowed.length || allowed.length === base.length) return DECIDE_TOOL;
+  const schema = JSON.parse(JSON.stringify(DECIDE_TOOL.input_schema));
+  schema.properties.format.enum = allowed;
+  return { ...DECIDE_TOOL, input_schema: schema };
+}
+
 export async function decideNextVideo(accountId: string): Promise<Decision> {
   const account = db.select().from(accounts).where(eq(accounts.id, accountId)).get();
   if (!account) throw new Error(`No account ${accountId}`);
@@ -126,6 +147,22 @@ export async function decideNextVideo(accountId: string): Promise<Decision> {
     .limit(15)
     .all();
 
+  const rejections = recentRejections(accountId);
+
+  // Ideas that were declined for want of footage, with what the search did
+  // turn up. Without this the decision kept naming incidents the archive has
+  // no film of (Plumbbob, Palomares, Ivy Mike in a row) and a slot went empty;
+  // the reasons say which films ARE there, so the next idea can start from one.
+  const noFootage = db
+    .select({ hook: clips.hookText, angle: clips.sourceUrl, why: clips.rationale, error: clips.error })
+    .from(clips)
+    .where(and(eq(clips.accountId, accountId), eq(clips.status, "declined")))
+    .orderBy(desc(clips.createdAt))
+    .limit(6)
+    .all()
+    // An owner's rejection is a different thing and is listed separately.
+    .filter((c) => !c.error && c.why);
+
   let read = "";
   if (analysis?.rawAnalysis) {
     try {
@@ -148,7 +185,7 @@ export async function decideNextVideo(accountId: string): Promise<Decision> {
     }
   }
 
-  const response = await anthropic().messages.create({
+  const response = await subscriptionMessagesCreate({
     model: MODELS.strategy,
     max_tokens: 4000,
     thinking: { type: "adaptive" },
@@ -164,7 +201,7 @@ export async function decideNextVideo(accountId: string): Promise<Decision> {
       "cannot be told over archive film - that pairing finds no footage and is declined. " +
       "The owner reads your justification and decides whether to trust it, so be specific and honest, " +
       "including about what you are unsure of.",
-    tools: [DECIDE_TOOL],
+    tools: [decideToolFor(accountId)],
     tool_choice: { type: "tool", name: "decide_next_video" },
     messages: [
       {
@@ -193,6 +230,20 @@ export async function decideNextVideo(accountId: string): Promise<Decision> {
           alreadyMade.length
             ? `ALREADY PRODUCED HERE (do not repeat):\n${alreadyMade
                 .map((c) => `- ${c.hook ?? c.angle}`)
+                .join("\n")}`
+            : "",
+          "",
+          rejections.length
+            ? `THE OWNER REJECTED THESE, IN THEIR OWN WORDS (do not make the same mistake):\n${rejections
+                .map((r) => `- ${r}`)
+                .join("\n")}`
+            : "",
+          "",
+          noFootage.length
+            ? "THESE IDEAS FOUND NO USABLE FOOTAGE (do not pick another story that needs film of one " +
+              "named incident the archive will not hold; where a reason names films that ARE " +
+              `available, build the next story on footage like that):\n${noFootage
+                .map((c) => `- ${(c.hook ?? c.angle).slice(0, 160)}\n  ${(c.why ?? "").slice(0, 600)}`)
                 .join("\n")}`
             : "",
           "",
@@ -390,6 +441,24 @@ export async function produceForSlot(accountId: string, payload: AutopilotPayloa
     type: "autopilot.started",
     message: `Making the video for ${when}. ${payload.why}`,
   });
+
+  // An account with a library folder takes its slots from it, in the same mix
+  // as "make one now" - and one set to library_share 1 takes nothing else.
+  if (libraryDir(accountId) && Math.random() < libraryShare(accountId)) {
+    const id = await makeLibraryClip(accountId, { scheduledFor: slot });
+    if (id) return;
+    if (libraryShare(accountId) >= 1) {
+      notify({
+        accountId,
+        level: "warn",
+        type: "autopilot.library_empty",
+        title: `No video for ${when}`,
+        body: "The library folder has nothing unposted left. Add clips to it - this account only posts from there.",
+        meta: { slotAt: payload.slotAt },
+      });
+      return;
+    }
+  }
 
   for (let attempt = 1; attempt <= SLOT_TRIES; attempt++) {
     let clipId: string;

@@ -21,12 +21,61 @@ yt-dlp · ffmpeg
 npm install
 npm run db:push      # create tables
 npm run db:seed      # create 2 accounts + 2 agents
-npm run dev          # dashboard  -> http://localhost:3000
-npm run worker       # autonomous loop (second terminal)
+npm run dev          # dashboard and autonomous worker together
 ```
 
 Full instructions, including how to get TikTok API access:
 **[SETUP.md](./SETUP.md)**
+
+## Claude subscription → Codex → Claude publishing
+
+With `EDITOR_BACKEND=codex`, the scheduled worker asks the locally signed-in
+Claude subscription to find and choose a podcast beat. It downloads that beat,
+then starts the locally signed-in Codex CLI to write and render a vertical
+podcast/visual-story edit. A successful render is checked for audio, vertical
+video, and duration. With `PUBLISH_BACKEND=claude` and `PHONE_PUBLISH=on`, the
+worker immediately gives the finished MP4 path, caption and scheduled posting
+time to a signed-in Claude background session. Codex ends its work at that
+handoff. Claude owns publishing; the worker does not operate the phone or mark
+the clip posted. `PHONE_DRY_RUN` applies only to the separate direct phone
+backend.
+
+Run `claude auth login` and `codex login` once for the Windows user that runs
+the worker. Start the worker with `npm run dev` (dashboard too) or
+`npm run worker` (worker only). Restart it after changing `.env.local`.
+Each Codex job saves `final.mp4` and `codex.log` under
+`../ai_aget_ae/runs/codex-jobs/<clipId>/` so failures can be inspected and
+successful renders can be reused after a restart.
+
+## Making and posting videos (review first)
+
+```bash
+npm run make -- sciencelabaratory      # queue one video (the worker makes it)
+npm run make -- norex055 --now         # or start it here, in the foreground
+npm run review                         # what is being made / waiting for you / posted
+npm run approve -- <clipId>            # OK it: exported if needed, then posted
+npm run phone:account -- --account norex055   # switch the phone and verify
+```
+
+Every video stops for your review; nothing posts without `npm run approve`,
+autopilot slots included. An approved video posts through the phone to its
+**own** account: the driver switches accounts (Profile menu -> Settings and
+privacy -> Switch account) and refuses to post unless the Profile tab then shows
+exactly that handle. The phone must be plugged in with a swipe-only lock (no
+PIN).
+
+Where each account's videos come from is set per account in the `settings`
+table:
+
+| key | example | meaning |
+|---|---|---|
+| `library_dir:<accountId>` | `C:/.../Valor Unleashed` | folder of finished clips to post from (edited motion-only) |
+| `library_share:<accountId>` | `0.75` | share of videos drawn from the folder; the rest are original narrated |
+| `formats:<accountId>` | `archive` | formats the decision may pick (`archive` = original narrated only) |
+| `clip_min_sec:<accountId>` / `clip_max_sec:<accountId>` | `58` / `36` | length window (After Effects edits aim at min/0.85 .. max*2.5) |
+
+Library clips are picked from those not yet posted, scored against the
+account's best-performing captions. Restart the worker after changing code.
 
 ## How it works
 

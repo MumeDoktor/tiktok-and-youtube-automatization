@@ -1,5 +1,5 @@
 import type Anthropic from "@anthropic-ai/sdk";
-import { anthropic } from "@/lib/anthropic";
+import { subscriptionMessagesCreate } from "@/lib/claude-subscription";
 import { MODELS } from "@/lib/env";
 import type { Move, Transition } from "@/lib/look";
 import { clearFrames, sampleRemoteFrames } from "@/lib/media";
@@ -164,7 +164,7 @@ export async function surveyFilm(
   });
 
   try {
-    const response = await anthropic().messages.create({
+    const response = await subscriptionMessagesCreate({
       model: MODELS.strategy,
       max_tokens: 4000,
       thinking: { type: "adaptive" },
@@ -322,7 +322,7 @@ export async function assignShots(
 ): Promise<Shot[]> {
   if (moments.length === 0) return [];
 
-  const response = await anthropic().messages.create({
+  const response = await subscriptionMessagesCreate({
     model: MODELS.strategy,
     max_tokens: 3000,
     thinking: { type: "adaptive" },

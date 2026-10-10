@@ -384,9 +384,17 @@ export const jobs = sqliteTable(
         "produce",
         "find_source",
         "edit_ae",
+        /** Re-edit a rejected video from the owner's notes (revise.ts). */
+        "revise_ae",
+        "edit_codex",
         "export_ae",
         "autopilot",
         "publish_phone",
+        "handoff_claude",
+        "make_video",
+        "post_now",
+        "check_comments",
+        "reply_comments",
       ],
     }).notNull(),
     /** JSON payload */

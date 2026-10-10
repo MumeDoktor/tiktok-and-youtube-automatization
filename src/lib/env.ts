@@ -112,6 +112,8 @@ export const env = {
    * PC, at their slot. Off unless set to "on" - it posts publicly, as you.
    */
   phonePublish: optional("PHONE_PUBLISH") === "on",
+  /** Claude Code controls the phone when selected; phone retains the legacy driver. */
+  publishBackend: optional("PUBLISH_BACKEND") === "claude" ? "claude" : "phone",
   /** Walk the whole posting flow but stop before tapping Post. */
   phoneDryRun: optional("PHONE_DRY_RUN") === "on",
   /** adb.exe. Defaults to the Android SDK's copy. */
@@ -139,15 +141,32 @@ export const env = {
    * After Effects for you to review and export; "remotion" renders it here,
    * unattended. "ae" falls back to Remotion when the editor is not installed.
    */
-  editorBackend: (optional("EDITOR_BACKEND") === "remotion" ? "remotion" : "ae") as
-    | "ae"
-    | "remotion",
+  editorBackend: (
+    optional("EDITOR_BACKEND") === "codex" ? "codex"
+      : optional("EDITOR_BACKEND") === "remotion" ? "remotion" : "ae"
+  ) as "ae" | "remotion" | "codex",
   /** Where ai_aget_ae lives, relative to this project. */
   aeEditorDir: optional("AE_EDITOR_DIR") ?? "../ai_aget_ae",
   /** Minutes between checks while a clip waits for After Effects to be free. */
   aeRetryMinutes: Number(optional("AE_RETRY_MINUTES") ?? 2),
   /** Windows notifications when a clip needs you. "off" keeps them in the activity log. */
   desktopNotifications: optional("DESKTOP_NOTIFICATIONS") !== "off",
+  /** Telegram bot from @BotFather: review videos and approve them from the phone. */
+  telegramBotToken: optional("TELEGRAM_BOT_TOKEN"),
+  /** The owner's chat. Left empty, the first chat to message the bot is taken. */
+  telegramChatId: optional("TELEGRAM_CHAT_ID"),
+  /**
+   * Answering comments on the newest posts, through the phone. "review" sends
+   * each drafted reply to Telegram for a yes; "auto" posts it without asking.
+   */
+  commentReplies: (["off", "auto"].find((m) => m === optional("COMMENT_REPLIES")) ?? "review") as
+    | "off"
+    | "review"
+    | "auto",
+  /** Only the newest posts are read: the last one and the one before it. */
+  commentPosts: Number(optional("COMMENT_POSTS") ?? 2),
+  /** Replies per video. With more comments than this, the most liked are answered. */
+  commentMaxReplies: Number(optional("COMMENT_MAX_REPLIES") ?? 3),
 } as const;
 
 export const MODELS = {

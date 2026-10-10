@@ -24,7 +24,13 @@
     "dev:web": "next dev",
     "probe:edit2": "tsx src/scripts/probe-edit2.ts",
     "phone:doctor": "python src/lib/tiktok_phone.py doctor",
-    "phone:inspect": "python src/lib/tiktok_phone.py inspect"
+    "phone:inspect": "python src/lib/tiktok_phone.py inspect",
+    "make": "tsx src/scripts/make.ts",
+    "approve": "tsx src/scripts/approve.ts",
+    "review": "tsx src/scripts/review.ts",
+    "phone:account": "python src/lib/tiktok_phone.py account",
+    "teaser": "tsx src/scripts/teaser.ts",
+    "comments": "tsx src/scripts/comments.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.120.0",

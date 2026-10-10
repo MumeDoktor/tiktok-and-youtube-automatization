@@ -191,7 +191,7 @@ export async function downloadVideo(
   ensureDirs();
   const { bin, prefix } = splitCmd(env.ytDlp);
   const template = path.join(rawDir, `${id}.%(ext)s`);
-  const maxHeight = opts.maxHeight ?? 1920;
+  const maxHeight = opts.maxHeight ?? 2160;
 
   // Start every attempt from a clean slate. A retry that leaves the previous
   // attempt's video on disk cannot tell the two apart afterwards, and a failed
@@ -213,9 +213,15 @@ export async function downloadVideo(
     "--no-playlist",
     "--no-warnings",
     "--newline",
-    // Cap resolution and prefer a single already-muxed mp4 where possible.
+    // The sharpest picture up to the cap, then the highest bitrate at it. A
+    // landscape interview is cropped to a vertical third of its width, so a
+    // 1080p source is upscaled ~1.8x and a 4K one is not; and at one resolution
+    // YouTube often offers a 2Mbps and a 5Mbps stream, which the default order
+    // did not tell apart. `res` is the smaller side, so the cap fits both shapes.
     "-f",
-    `bv*[height<=${maxHeight}]+ba/b[height<=${maxHeight}]/b`,
+    "bv*+ba/b",
+    "-S",
+    `res:${maxHeight},br`,
     "--merge-output-format",
     "mp4",
     "-o",
@@ -658,6 +664,48 @@ export async function hasVideoStream(file: string): Promise<boolean> {
  * ffmpeg's -t reads the bad timestamps and stops after half a second. A
  * remux costs no quality and no real time, and restores both.
  */
+/**
+ * Brings a low-resolution vertical clip up to 1080x1920 before it is edited.
+ *
+ * The library folder's clips are mostly 360x640. Left to After Effects they are
+ * stretched 3x with its default resampling and come out soft; a Lanczos scale
+ * with light sharpening, encoded near-lossless, holds detail noticeably better.
+ * Nothing can add detail the source never had - this only stops losing more.
+ * Returns the input untouched when it is already full height.
+ */
+export async function upscaleVertical(input: string, id: string): Promise<string> {
+  const info = await probe(input);
+  if (!info.height || info.height >= 1600) return input;
+  const { bin, prefix } = splitCmd(env.ffmpeg);
+  const dir = path.join(mediaDir, "upscaled");
+  fs.mkdirSync(dir, { recursive: true });
+  const target = path.join(dir, `${id}.mp4`);
+  await run(
+    bin,
+    [
+      ...prefix,
+      "-y",
+      "-i",
+      path.resolve(input),
+      "-vf",
+      "scale=-2:1920:flags=lanczos,unsharp=5:5:0.6:5:5:0.0",
+      "-c:v",
+      "libx264",
+      "-crf",
+      "14",
+      "-preset",
+      "slow",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "copy",
+      target,
+    ],
+    { timeoutMs: 10 * 60_000 },
+  );
+  return fs.existsSync(target) && fs.statSync(target).size > 10_000 ? target : input;
+}
+
 export async function remux(input: string): Promise<string> {
   const { bin, prefix } = splitCmd(env.ffmpeg);
   const source = path.resolve(input);

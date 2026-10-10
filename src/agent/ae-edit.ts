@@ -17,7 +17,8 @@ import { extractThumbnail, probe } from "@/lib/media";
 import { postBy } from "./autopilot";
 import { enqueue, noteProgress } from "./events";
 import { notify } from "./notify";
-import { schedulePublish } from "./publish";
+import { isApproved } from "./approval";
+import { sendForReview } from "./telegram-review";
 
 /**
  * Clips edited in After Effects.
@@ -36,6 +37,14 @@ export type AeEditPayload = {
   targetSec: number;
   /** A bed laid under the finished edit, rather than baked into the source. */
   musicPath?: string | null;
+  /** Edit every span as given - the source is already the story. */
+  keepAll?: boolean;
+  /** The source is already captioned (a library clip): add motion only. */
+  motionOnly?: boolean;
+  appetite?: number;
+  /** From the owner's review (see revise.ts). */
+  musicDb?: number;
+  dropSpans?: number[];
 };
 
 function setStatus(clipId: string, status: string, fields: Record<string, unknown> = {}) {
@@ -89,6 +98,12 @@ export async function editInAe(accountId: string, payload: AeEditPayload) {
     sourcePath: payload.sourcePath,
     targetSec: payload.targetSec,
     musicPath: payload.musicPath,
+    keepAll: payload.keepAll,
+    motionOnly: payload.motionOnly,
+    appetite: payload.appetite,
+    musicDb: payload.musicDb,
+    dropSpans: payload.dropSpans,
+    script: spokenText(clip.script),
     onProgress: (message) => noteProgress(clip.id, message),
   });
 
@@ -127,6 +142,13 @@ export async function editInAe(accountId: string, payload: AeEditPayload) {
     throw new Error(message);
   }
 
+  // A rebuild makes every EARLIER export stale. Left in the export folder, the
+  // old file was taken for the new render - "ready" pointed at the previous cut
+  // and the rebuilt edit was never rendered. Only files older than this build
+  // move (aside, not deleted): moving everything up front also moved the one
+  // real render of an edit the editor then reported as "already built".
+  supersedeExports(clip.id, Date.parse(outcome.builtAt));
+
   setStatus(clip.id, "review_in_ae", {
     outputDurationSec: outcome.durationSec,
     error: null,
@@ -152,6 +174,34 @@ export async function editInAe(accountId: string, payload: AeEditPayload) {
     body: `${hook} - ${Math.round(outcome.durationSec)}s, comp ${outcome.comp}.${postBy(clip)} Export into the clip's export folder when you are happy with it.`,
     meta: { clipId: clip.id, ...outcome },
   });
+}
+
+/**
+ * The narration as written, for a clip whose voice-over we wrote. Whisper heard
+ * "fissile core" as "thistle core" and it went on screen; with the script the
+ * transcript takes our words and keeps only Whisper's timing.
+ */
+function spokenText(script: string | null): string | null {
+  if (!script) return null;
+  try {
+    const lines = JSON.parse(script) as { text?: string }[];
+    return lines.map((l) => l.text ?? "").filter(Boolean).join(" ") || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Moves exports older than a build into export/superseded/. */
+function supersedeExports(clipId: string, builtAtMs: number) {
+  const dir = aeExportDir(clipId);
+  if (!fs.existsSync(dir) || !Number.isFinite(builtAtMs)) return;
+  const old = fs.readdirSync(dir)
+    .filter((f) => /\.(mp4|mov)$/i.test(f))
+    .filter((f) => fs.statSync(path.join(dir, f)).mtimeMs < builtAtMs);
+  if (!old.length) return;
+  const to = path.join(dir, "superseded");
+  fs.mkdirSync(to, { recursive: true });
+  for (const f of old) fs.renameSync(path.join(dir, f), path.join(to, `${Date.now()}-${f}`));
 }
 
 /**
@@ -225,7 +275,18 @@ async function markExported(clip: typeof clips.$inferSelect, file: string) {
     body: `${clip.hookText || clip.sourceTitle || "Clip"} - ${Math.round(info.durationSec)}s, caption and hashtags attached.${postBy(clip)}`,
     meta: { clipId: clip.id, path: file },
   });
-  schedulePublish(clip.id);
+  if (isApproved(clip.id)) {
+    // Approved in review: out now, to its own account, through the phone.
+    enqueue({ accountId: clip.accountId, type: "post_now", payload: { clipId: clip.id }, maxAttempts: 3 });
+    noteProgress(clip.id, "Approved - posting now");
+    return;
+  }
+  // The owner reviews every video before it goes out (decided 2026-09-30).
+  // With AE_AUTO_EXPORT on, an edit exports unattended - so an export alone
+  // must never post, autopilot slot or not. It waits for `npm run approve`.
+  noteProgress(clip.id, `Waiting for your OK - watch ${file}, then: npm run approve -- ${clip.id}`);
+  // Or from the phone: the video with Approve / Reject under it.
+  await sendForReview(clip, file, info.durationSec);
 }
 
 /**

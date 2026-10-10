@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 
 import { env } from "@/lib/env";
+import { telegramText } from "@/lib/telegram";
 import { logEvent, type EventLevel } from "./events";
 
 /**
@@ -25,8 +26,13 @@ export function notify(args: {
     type: args.type,
     message: `${args.title} - ${args.body}`,
     meta: args.meta,
+    // Sent below, in its own words.
+    telegram: false,
   });
   desktopToast(args.title, args.body);
+  // A finished export goes to the phone as the video itself, with buttons
+  // (sendForReview) - not as a second, text-only message.
+  if (args.type !== "clip.exported") telegramText(`${args.title}\n${args.body}`);
 }
 
 function xmlEscape(s: string): string {

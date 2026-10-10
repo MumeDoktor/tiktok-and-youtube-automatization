@@ -2,7 +2,7 @@ import { desc, eq, sql } from "drizzle-orm";
 import type Anthropic from "@anthropic-ai/sdk";
 import { db } from "@/db";
 import { accounts, contentProfiles, marketInsights, posts } from "@/db/schema";
-import { anthropic } from "@/lib/anthropic";
+import { subscriptionMessagesCreate } from "@/lib/claude-subscription";
 import { MODELS } from "@/lib/env";
 import { zonedParts } from "@/lib/tz";
 import { logEvent } from "./events";
@@ -330,7 +330,7 @@ export async function analyzeAccount(accountId: string) {
         `${v.publishedAt?.toISOString().slice(0, 10) ?? "?"} | ${v.caption.slice(0, 110)}`,
     );
 
-  const response = await anthropic().messages.create({
+  const response = await subscriptionMessagesCreate({
     model: MODELS.strategy,
     max_tokens: 8000,
     thinking: { type: "adaptive" },

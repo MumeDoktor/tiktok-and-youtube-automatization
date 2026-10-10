@@ -4,7 +4,7 @@ import { eq } from "drizzle-orm";
 import type Anthropic from "@anthropic-ai/sdk";
 import { db } from "@/db";
 import { accounts, clips, contentProfiles } from "@/db/schema";
-import { anthropic } from "@/lib/anthropic";
+import { subscriptionMessagesCreate } from "@/lib/claude-subscription";
 import { searchArchive, type ArchiveItem } from "@/lib/archiveorg";
 import { downloadAsset, getAsset, searchVideos, type DvidsAsset } from "@/lib/dvids";
 import { env, MODELS } from "@/lib/env";
@@ -166,7 +166,11 @@ export type FootagePick = {
  * distinction is worth 4.7x: footage-led posts median 961 views against 4,539
  * for story-led posts.
  */
-export async function findFootage(accountId: string, angle: string): Promise<FootagePick> {
+export async function findFootage(
+  accountId: string,
+  angle: string,
+  exclude: ReadonlySet<string> = new Set(),
+): Promise<FootagePick> {
   const account = db.select().from(accounts).where(eq(accounts.id, accountId)).get();
   if (!account) throw new Error(`No account ${accountId}`);
 
@@ -178,10 +182,56 @@ export async function findFootage(accountId: string, angle: string): Promise<Foo
 
   // Two phrasings: both archives are keyword-matched and one wording often
   // returns nothing usable.
+  //
+  // The decision often writes several searches in one string, joined by ";" -
+  // "B-47 Stratojet takeoff 1950s; Strategic Air Command bomber crew
+  // briefing; ...". The archive ANDs every word, so the whole string matched
+  // nothing and its first three words ("B-47 Stratojet takeoff") were too
+  // narrow for mid-century film: a strong story was declined for no footage
+  // twice. Each phrase is tried on its own, then a two-word form of it.
+  const phrases = angle.split(/[;|\n]+/).map((p) => p.trim()).filter(Boolean);
+  const queries = [
+    angle,
+    ...phrases,
+    ...phrases.map((p) => p.split(/\s+/).filter((w) => !/^\d{4}s?$/.test(w)).slice(0, 2).join(" ")),
+    angle.split(/\s+/).slice(0, 3).join(" "),
+  ].filter((q, i, all) => q && all.indexOf(q) === i).slice(0, 10);
+  // A few from EVERY phrase rather than stopping at the first dozen: stopping
+  // early filled the list from "Strategic Air" and "rural South" and the
+  // chooser never saw the atomic-bomb films the story actually needed.
   const seen = new Map<string, Candidate>();
-  for (const q of [angle, angle.split(/\s+/).slice(0, 3).join(" ")]) {
+  for (const q of queries) {
+    let took = 0;
     for (const c of await searchAllSources(accountId, q)) {
-      if (!seen.has(c.key)) seen.set(c.key, c);
+      if (took >= 4) break;
+      if (!seen.has(c.key) && !exclude.has(c.key)) {
+        seen.set(c.key, c);
+        took++;
+      }
+    }
+  }
+
+  // One long phrase with no ";" leaves only the whole string and its first
+  // words to search, and every word must match: "Operation Plumbbob 1957 Shot
+  // John Genie rocket F-89 Scorpion ... Nevada Test Site" found nothing while
+  // "Nevada Test" alone finds the atomic films. When the list is thin, the
+  // phrase is walked two words at a time.
+  if (seen.size < 6) {
+    const words = angle
+      .split(/[\s;|,]+/)
+      .filter((w) => w.length > 2 && !/^\d{4}s?$/.test(w));
+    const pairs: string[] = [];
+    for (let i = 0; i + 1 < words.length; i++) pairs.push(`${words[i]} ${words[i + 1]}`);
+    for (const q of pairs.filter((p) => !queries.includes(p)).slice(0, 12)) {
+      if (seen.size >= 12) break;
+      let took = 0;
+      for (const c of await searchAllSources(accountId, q)) {
+        if (took >= 3) break;
+        if (!seen.has(c.key) && !exclude.has(c.key)) {
+          seen.set(c.key, c);
+          took++;
+        }
+      }
     }
   }
 
@@ -205,7 +255,7 @@ export async function findFootage(accountId: string, angle: string): Promise<Foo
     )
     .join("\n\n");
 
-  const response = await anthropic().messages.create({
+  const response = await subscriptionMessagesCreate({
     model: MODELS.strategy,
     max_tokens: 4000,
     thinking: { type: "adaptive" },
@@ -281,83 +331,108 @@ export async function makeDvidsClip(accountId: string, clipId: string) {
     const angle = clip.sourceUrl;
     const agreedHook = clip.hookText;
     const agreedCaption = clip.caption;
-    const pick = await findFootage(accountId, angle);
-
-    if (!pick.found || !pick.candidate) {
-      setStatus(clipId, "declined", { rationale: pick.reason });
-      logEvent({
-        accountId,
-        level: "info",
-        type: "clip.declined",
-        message: `No usable footage: ${pick.reason}`,
-      });
-      return;
-    }
-
-    const chosen = pick.candidate;
-    noteProgress(clipId, `Chose the film "${chosen.title}" (${chosen.when})`);
-
-    setStatus(clipId, "looking", {
-      dvidsId: chosen.source === "dvids" ? chosen.dvids?.id : chosen.archive?.id,
-      sourceUrl: chosen.pageUrl,
-      sourceTitle: chosen.title,
-      sourceUploader: chosen.credit,
-      sourceDurationSec: chosen.durationSec,
-      rationale: pick.reason,
-    });
-
-    /* -------------------------------------------------------------- */
-    /* 1. Look at the film                                             */
-    /* -------------------------------------------------------------- */
-
-    // A DVIDS asset is short and purpose-shot, so it is fetched whole and cut
-    // on disk. Archive films run past twenty minutes, so they are sampled over
-    // HTTP range requests and only the chosen shots are ever downloaded.
+    // A film the picker liked on paper is often wrong once its frames are seen
+    // (Mars Bluff: "Airport America" was all crop-dusters). Rejected films are
+    // excluded and the next best is tried, a few times, before giving up. A
+    // decline also puts the angle back in sourceUrl - the chosen film's URL
+    // overwrites it below, and a retry would otherwise search for that film.
+    const MAX_FILMS = 3;
+    const rejected = new Set<string>();
+    const decline = (rationale: string, type: string, message: string) => {
+      setStatus(clipId, "declined", { rationale, sourceUrl: angle });
+      logEvent({ accountId, level: "info", type, message });
+    };
+    let chosen: Candidate | undefined;
+    let survey: Awaited<ReturnType<typeof surveyFilm>> | undefined;
     let localFile: string | null = null;
-    let filmLength = chosen.durationSec ?? 0;
 
-    if (chosen.source === "dvids" && chosen.dvids) {
-      const asset = chosen.dvids.downloadUrl
-        ? chosen.dvids
-        : ((await getAsset(chosen.dvids.id)) ?? chosen.dvids);
-      localFile = await downloadAsset(asset, clipId);
-      filmLength = (await probe(localFile)).durationSec;
-    } else {
-      const probed = await probeRemoteDuration(chosen.pageUrl);
-      if (!probed || probed <= 0) {
-        setStatus(clipId, "declined", {
-          rationale:
-            "Could not establish how long this film is, so there is no way to sample it and no way to know what is in it.",
-        });
+    for (let attempt = 1; attempt <= MAX_FILMS; attempt++) {
+      const pick = await findFootage(accountId, angle, rejected);
+      if (!pick.found || !pick.candidate) {
+        const why = rejected.size ? `${pick.reason} (after rejecting ${rejected.size} film(s) on sight)` : pick.reason;
+        decline(why, "clip.declined", `No usable footage: ${why}`);
+        return;
+      }
+
+      const film = pick.candidate;
+      noteProgress(clipId, `Chose the film "${film.title}" (${film.when})`);
+
+      setStatus(clipId, "looking", {
+        dvidsId: film.source === "dvids" ? film.dvids?.id : film.archive?.id,
+        sourceUrl: film.pageUrl,
+        sourceTitle: film.title,
+        sourceUploader: film.credit,
+        sourceDurationSec: film.durationSec,
+        rationale: pick.reason,
+      });
+
+      /* ------------------------------------------------------------ */
+      /* 1. Look at the film                                           */
+      /* ------------------------------------------------------------ */
+
+      // A DVIDS asset is short and purpose-shot, so it is fetched whole and cut
+      // on disk. Archive films run past twenty minutes, so they are sampled over
+      // HTTP range requests and only the chosen shots are ever downloaded.
+      let file: string | null = null;
+      let filmLength = film.durationSec ?? 0;
+
+      if (film.source === "dvids" && film.dvids) {
+        const asset = film.dvids.downloadUrl
+          ? film.dvids
+          : ((await getAsset(film.dvids.id)) ?? film.dvids);
+        file = await downloadAsset(asset, clipId);
+        filmLength = (await probe(file)).durationSec;
+      } else {
+        const probed = await probeRemoteDuration(film.pageUrl);
+        if (!probed || probed <= 0) {
+          noteProgress(clipId, `Could not tell how long "${film.title}" is - trying another film`);
+          rejected.add(film.key);
+          continue;
+        }
+        filmLength = probed;
+      }
+
+      noteProgress(
+        clipId,
+        `Sampling frames across ${Math.round(filmLength / 60)} minutes of film to see what is actually in it`,
+      );
+
+      const looked = await surveyFilm(accountId, film.pageUrl, filmLength, angle);
+      if (!looked.found || looked.moments.length === 0) {
+        noteProgress(clipId, `Looked at the footage and rejected it: ${looked.reason}`);
         logEvent({
           accountId,
           level: "info",
-          type: "clip.declined",
-          message: `Unknown duration for "${chosen.title}"`,
+          type: "clip.rejected_on_sight",
+          message: `Rejected "${film.title}" after looking: ${looked.reason}`,
         });
-        return;
+        rejected.add(film.key);
+        if (file) {
+          try {
+            fs.unlinkSync(file);
+          } catch {
+            // Not fatal.
+          }
+        }
+        if (attempt === MAX_FILMS) {
+          decline(
+            `Looked at ${MAX_FILMS} films and none fit. Last: ${looked.reason}`,
+            "clip.declined_on_sight",
+            `Rejected ${MAX_FILMS} films on sight for "${angle.slice(0, 80)}"`,
+          );
+          return;
+        }
+        continue;
       }
-      filmLength = probed;
+
+      chosen = film;
+      survey = looked;
+      localFile = file;
+      break;
     }
 
-    noteProgress(
-      clipId,
-      `Sampling frames across ${Math.round(filmLength / 60)} minutes of film to see what is actually in it`,
-    );
-
-    const survey = await surveyFilm(accountId, chosen.pageUrl, filmLength, angle);
-
-    if (!survey.found || survey.moments.length === 0) {
-      noteProgress(clipId, `Looked at the footage and rejected it: ${survey.reason}`);
-      setStatus(clipId, "declined", {
-        rationale: `Looked at the footage and it does not fit: ${survey.reason}`,
-      });
-      logEvent({
-        accountId,
-        level: "info",
-        type: "clip.declined_on_sight",
-        message: `Rejected "${chosen.title}" after looking: ${survey.reason}`,
-      });
+    if (!chosen || !survey) {
+      decline("No film could be sampled.", "clip.declined", `No film could be sampled for "${angle.slice(0, 80)}"`);
       return;
     }
 
@@ -388,7 +463,7 @@ export async function makeDvidsClip(accountId: string, clipId: string) {
 
     // The writer overruns its word budget often enough that this cannot be
     // left to the prompt alone.
-    const budgetSec = sourceWindowSec().maxSec;
+    const budgetSec = sourceWindowSec(accountId).maxSec;
     const spoken = trimToBudget(script.lines, budgetSec);
     if (spoken.length < script.lines.length) {
       noteProgress(
@@ -431,6 +506,19 @@ export async function makeDvidsClip(accountId: string, clipId: string) {
     const planned = await assignShots(spoken, narration.lines, survey.moments);
     if (planned.length === 0) {
       throw new Error("No shots could be assigned to the narration.");
+    }
+
+    // The first picture is the event itself, when the film has it. The shot
+    // list follows the narration, which opens on set-up - so the Bikini story
+    // began on a cloud bank and reached its explosion at 58 seconds, long
+    // after anyone deciding in the first second had gone. The blast returns
+    // where the story reaches it; seen twice, it is a cold open.
+    const strongest = survey.moments
+      .filter((m) => m.energy === "violent")
+      .sort((a, b) => b.atSec - a.atSec)[0];
+    if (strongest && planned[0].atSec !== strongest.atSec) {
+      planned[0] = { ...planned[0], atSec: strongest.atSec, whatIsVisible: strongest.whatIsVisible };
+      noteProgress(clipId, `Opening on the strongest footage: ${strongest.whatIsVisible}`);
     }
 
     setStatus(clipId, "downloading", {
@@ -580,42 +668,6 @@ export async function makeDvidsClip(accountId: string, clipId: string) {
       shots[0] = { ...shots[0], transition: "cut", transitionMs: 0 };
     }
 
-    /* -------------------------------------------------------------- */
-    /* Cold open                                                       */
-    /* -------------------------------------------------------------- */
-
-    // Retention is decided in the first second, and the first second of a
-    // story-shaped edit is its slowest - the open plants a question instead
-    // of showing something. So the most violent moment in the film leads:
-    // half a second of it under the hook, hard-cut into line one, before the
-    // viewer's thumb has time to move. The narration never shifts; the
-    // picture simply starts early.
-    const COLD_OPEN_MS = 700;
-    const violent = survey.moments
-      .filter((m) => m.energy === "violent")
-      .sort((a, b) => b.atSec - a.atSec)[0];
-    const opener = shots[0];
-    if (opener && violent) {
-      // Sourced from the same file as shot one, so no extra download; the
-      // punch-in move sells it as a deliberate teaser rather than a glitch.
-      shots.unshift({
-        path: opener.path,
-        startMs: 0,
-        endMs: COLD_OPEN_MS,
-        move: "punch",
-        transition: "cut",
-        transitionMs: 0,
-      });
-      // Shot two now arrives over the cold open with a hard cut at 700ms.
-      shots[1].transition = "cut";
-      shots[1].transitionMs = 0;
-      logEvent({
-        accountId,
-        type: "edit.cold_open",
-        message: `Cold open on a ${COLD_OPEN_MS}ms violent moment before the narration starts`,
-      });
-    }
-
     if (shots.length === 0) {
       throw new Error("None of the chosen shots could be downloaded.");
     }
@@ -667,11 +719,45 @@ export async function makeDvidsClip(accountId: string, clipId: string) {
       const payload: AeEditPayload = {
         clipId,
         sourcePath: precut,
-        targetSec: aeTargetSec(narration.durationMs / 1000),
+        // The narration IS the story, written to this account's length: edit
+        // all of it. Cut to aeTargetSec it lost its ending, and at the global
+        // 30s cap a 61s+ story for a monetized account came out unmonetizable.
+        targetSec: Math.ceil(narration.durationMs / 1000),
+        keepAll: true,
+        // A narrated archive story is carried by its pictures: the film is a
+        // generic reel, the public-domain photographs make it THIS story. The
+        // measured rate is for talking heads and left Mars Bluff with none.
+        appetite: 3,
         musicPath: track?.path ?? null,
       };
       enqueue({ accountId, type: "edit_ae", payload });
       noteProgress(clipId, "Pre-cut ready - queued for the After Effects editor");
+
+      // The short version of the same story, for accounts that asked for one.
+      // It is a second video in its own right, so failing to make it must
+      // never cost the long one that is already queued.
+      try {
+        const { makeTeaser, teaserEnabled } = await import("./teaser");
+        if (teaserEnabled(accountId)) {
+          const teaserId = await makeTeaser(accountId, {
+            parentClipId: clipId,
+            angle: agreedHook || angle,
+            narration: spoken.map((l) => l.text),
+            film: { title: chosen.title, pageUrl: chosen.pageUrl, credit: chosen.credit, when: chosen.when },
+            moments: survey.moments,
+            // The whole-asset download was deleted above once its shots were cut.
+            localFile: null,
+          });
+          noteProgress(clipId, `Short version made as ${teaserId} - sent for review`);
+        }
+      } catch (err) {
+        logEvent({
+          accountId,
+          level: "warn",
+          type: "teaser.failed",
+          message: `No short version this time: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
       return;
     }
     noteProgress(
@@ -769,4 +855,3 @@ function alternateMove(move: Move): Move {
   };
   return swap[move] ?? "push";
 }
-

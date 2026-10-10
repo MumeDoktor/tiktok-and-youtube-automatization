@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import type Anthropic from "@anthropic-ai/sdk";
 import { db } from "@/db";
 import { accounts, clips, contentProfiles } from "@/db/schema";
-import { anthropic } from "@/lib/anthropic";
+import { subscriptionMessagesCreate } from "@/lib/claude-subscription";
 import { env, MODELS } from "@/lib/env";
 import {
   downloadVideo,
@@ -32,6 +32,8 @@ import {
 import { planSoundDesign } from "@/lib/mix";
 import { renderClip } from "@/lib/remotion";
 import { aeTargetSec, sourceWindowSec, useAeEditor } from "@/lib/ae-editor";
+import { useCodexEditor } from "@/lib/codex-editor";
+import type { CodexEditPayload } from "./codex-edit";
 import { latestAnalysis } from "./account-analysis";
 import type { AeEditPayload } from "./ae-edit";
 import { enqueue, logEvent, noteProgress } from "./events";
@@ -296,9 +298,9 @@ export async function chooseSegments(
     }
   }
 
-  const lengthWindow = sourceWindowSec();
+  const lengthWindow = sourceWindowSec(accountId);
 
-  const response = await anthropic().messages.create({
+  const response = await subscriptionMessagesCreate({
     model: MODELS.strategy,
     // Five segments each carry a hook, a caption, hashtags, a quote and a
     // justification, and adaptive thinking draws from the same budget. The old
@@ -466,7 +468,7 @@ export async function treatSegment(
   if (lines.length === 0) return fallback;
 
   try {
-    const response = await anthropic().messages.create({
+    const response = await subscriptionMessagesCreate({
       model: MODELS.strategy,
       max_tokens: 3000,
       system:
@@ -734,11 +736,6 @@ export async function cutClip(accountId: string, clipId: string) {
   try {
     setStatus(clipId, "downloading");
 
-    // The captions again, rather than the rendered transcript on the row: they
-    // are kilobytes, and they carry the exact word timings the burned-in
-    // captions are cut against, which the rendered text has already rounded away.
-    const transcript = await fetchTranscript(clip.sourceUrl, clipId);
-
     // Only worth paying for the video now, and only for the part that was
     // chosen. Fetching the whole source and then cutting nothing out of it is
     // what made a two-hour podcast render as two hours of footage with
@@ -753,6 +750,13 @@ export async function cutClip(accountId: string, clipId: string) {
       sourceUploader: dl.uploader,
     });
 
+    if (useCodexEditor()) {
+      const payload: CodexEditPayload = { clipId, sourcePath: dl.path };
+      enqueue({ accountId, type: "edit_codex", payload, maxAttempts: 3 });
+      noteProgress(clipId, `Downloaded ${Math.round(durationSec)}s - queued for Codex's podcast/story edit`);
+      return;
+    }
+
     // After Effects makes its own cut, captions, treatments and sound, so
     // everything below - sentence cuts, the treatment pass, sound design, the
     // Remotion render - is the other backend's version of the same decisions
@@ -763,12 +767,16 @@ export async function cutClip(accountId: string, clipId: string) {
       const payload: AeEditPayload = {
         clipId,
         sourcePath: dl.path,
-        targetSec: aeTargetSec(lengthSec),
+        targetSec: aeTargetSec(lengthSec, accountId),
       };
       enqueue({ accountId, type: "edit_ae", payload });
       noteProgress(clipId, `Downloaded ${Math.round(lengthSec)}s - queued for the After Effects editor`);
       return;
     }
+
+    // The Remotion editor needs the full word timings for its own captions.
+    // Codex and After Effects derive their captions directly from the audio.
+    const transcript = await fetchTranscript(clip.sourceUrl, clipId);
 
     // Caption and cut.
     // The speaker is the audio, so there is no narration to add - the source

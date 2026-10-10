@@ -8,16 +8,18 @@ import { accounts, clips, jobs } from "@/db/schema";
 import { env } from "@/lib/env";
 import { mediaDir } from "@/lib/media";
 import { formatSlot } from "./autopilot";
+import { isApproved } from "./approval";
 import { enqueue, logEvent, noteProgress } from "./events";
 import { notify } from "./notify";
+import { telegramPhoto } from "@/lib/telegram";
 
 /**
  * Posting through the phone.
  *
  * TikTok's API will not post for an unaudited app, so the video goes out the
  * way a person would put it up: through the TikTok app on the Android phone
- * plugged into this PC. src/lib/tiktok_phone.py does the driving - it copies
- * the file over adb, opens it in TikTok and taps through to Post.
+ * plugged into this PC. This direct driver is only used when the phone
+ * backend is selected. Claude receives a finished video in a separate handoff.
  *
  * Only videos made for an autopilot slot are posted, and only at their slot.
  * One that finishes late goes out as soon as it is ready - a late post beats
@@ -53,6 +55,12 @@ function pendingPublish(clipId: string) {
     .find((j) => (JSON.parse(j.payload) as Partial<PublishPayload>).clipId === clipId);
 }
 
+function existingHandoff(clipId: string) {
+  return db.select().from(jobs).where(eq(jobs.type, "handoff_claude")).all()
+    .find((j) => j.status !== "cancelled" &&
+      (JSON.parse(j.payload) as Partial<PublishPayload>).clipId === clipId);
+}
+
 /**
  * Queues the post for a finished clip, at its slot. A no-op for a clip not
  * made for a slot, with phone publishing off, or with a post already queued.
@@ -60,9 +68,25 @@ function pendingPublish(clipId: string) {
 export function schedulePublish(clipId: string) {
   if (!env.phonePublish) return;
   const clip = db.select().from(clips).where(eq(clips.id, clipId)).get();
-  if (!clip || clip.status !== "ready" || !clip.scheduledFor) return;
+  if (!clip || clip.status !== "ready") return;
+  // Nothing goes public unreviewed - not even at its autopilot slot.
+  if (!isApproved(clipId)) {
+    noteProgress(clipId, `Ready - waiting for your OK: npm run approve -- ${clipId}`);
+    return;
+  }
   const account = db.select().from(accounts).where(eq(accounts.id, clip.accountId)).get();
   if (!account?.autopilot) return;
+  if (env.publishBackend === "claude") {
+    if (existingHandoff(clipId)) return;
+    const old = pendingPublish(clipId);
+    if (old?.status === "queued") {
+      db.update(jobs).set({ status: "cancelled" }).where(eq(jobs.id, old.id)).run();
+    }
+    enqueue({ accountId: clip.accountId, type: "handoff_claude", payload: { clipId } });
+    noteProgress(clipId, `Video ready; handing MP4 and posting time to Claude${clip.scheduledFor ? ` (${formatSlot(clip.scheduledFor, account.timezone)})` : ""}`);
+    return;
+  }
+  if (!clip.scheduledFor) return;
   if (pendingPublish(clipId)) return;
 
   const runAt = new Date(Math.max(Date.now(), clip.scheduledFor.getTime()));
@@ -76,10 +100,10 @@ export function schedulePublish(clipId: string) {
   noteProgress(clipId, `Posting through the phone at ${formatSlot(runAt, account.timezone)}`);
 }
 
-type PhoneResult = { ok: boolean; stage?: string; error?: string; screenshot?: string; dryRun?: boolean };
+export type PhoneResult = { ok: boolean; stage?: string; error?: string; screenshot?: string; dryRun?: boolean };
 
 /** Runs the phone driver and returns the JSON it prints last. */
-function runPhone(args: string[]): Promise<PhoneResult> {
+export function runPhone<T extends PhoneResult = PhoneResult>(args: string[]): Promise<T> {
   return new Promise((resolve) => {
     const child = spawn(env.python, [path.join("src", "lib", "tiktok_phone.py"), ...args], {
       cwd: process.cwd(),
@@ -96,15 +120,15 @@ function runPhone(args: string[]): Promise<PhoneResult> {
     const timer = setTimeout(() => child.kill("SIGKILL"), 15 * 60_000);
     child.on("error", (e) => {
       clearTimeout(timer);
-      resolve({ ok: false, stage: "start", error: `could not start ${env.python}: ${e.message}` });
+      resolve({ ok: false, stage: "start", error: `could not start ${env.python}: ${e.message}` } as T);
     });
     child.on("close", (code) => {
       clearTimeout(timer);
       const last = out.trim().split(/\r?\n/).pop() ?? "";
       try {
-        resolve(JSON.parse(last) as PhoneResult);
+        resolve(JSON.parse(last) as T);
       } catch {
-        resolve({ ok: false, stage: "driver", error: `exited ${code}: ${tail.slice(-8).join("\n")}` });
+        resolve({ ok: false, stage: "driver", error: `exited ${code}: ${tail.slice(-8).join("\n")}` } as T);
       }
     });
   });
@@ -124,7 +148,7 @@ export async function publishClip(accountId: string, payload: PublishPayload) {
   const captionFile = path.join(shots, `${clip.id}.caption.txt`);
   fs.writeFileSync(captionFile, postText(clip), "utf8");
 
-  noteProgress(clip.id, env.phoneDryRun ? "Posting through the phone (dry run)" : "Posting through the phone");
+  noteProgress(clip.id, `Posting through the phone${env.phoneDryRun ? " (dry run)" : ""}`);
   const args = [
     "post",
     "--file", path.resolve(clip.outputPath),
@@ -135,12 +159,28 @@ export async function publishClip(accountId: string, payload: PublishPayload) {
     "--tag", clip.id,
   ];
   if (env.phoneSerial) args.push("--serial", env.phoneSerial);
+  // Always the CLIP'S account. The phone serves several TikTok accounts and
+  // posts to whichever is active; the driver switches to this one and refuses
+  // to post unless the Profile tab then reads exactly this handle.
+  const account = db.select().from(accounts).where(eq(accounts.id, clip.accountId)).get();
+  if (!account) throw new Error(`Clip ${clip.id} has no account`);
+  args.push("--account", account.handle);
   if (env.phoneDryRun) args.push("--dry-run");
 
   const result = await runPhone(args);
   if (!result.ok) {
     const where = result.screenshot ? ` Screenshot: ${result.screenshot}` : "";
     noteProgress(clip.id, `Posting failed at ${result.stage ?? "?"}: ${result.error ?? "unknown"}`);
+    // What the phone was showing, straight to the owner: a popup nobody
+    // listed is fixed with one tap on the phone, before the retry comes round.
+    if (result.screenshot) {
+      void telegramPhoto(
+        result.screenshot,
+        `⚠️ @${account.handle} post stuck at "${result.stage ?? "?"}": ${result.error ?? "unknown"}
+` +
+          `This is the phone's screen. Clear whatever is in the way on the phone - it retries on its own.`,
+      );
+    }
     throw new Error(`Phone post failed at ${result.stage ?? "?"}: ${result.error ?? "unknown"}.${where}`);
   }
 
@@ -167,12 +207,12 @@ export async function publishClip(accountId: string, payload: PublishPayload) {
 }
 
 /** Called by the worker when the last attempt at a post has failed. */
-export function reportPublishGaveUp(accountId: string | null, message: string) {
+export function reportPublishGaveUp(accountId: string | null, message: string, handoff = false) {
   notify({
     accountId,
     level: "error",
-    type: "clip.post_failed",
-    title: "TikTok post failed",
+    type: handoff ? "clip.handoff_failed" : "clip.post_failed",
+    title: handoff ? "Claude handoff failed" : "TikTok post failed",
     body: `Gave up after ${env.publishAttempts} tries. ${message}`.slice(0, 400),
   });
 }

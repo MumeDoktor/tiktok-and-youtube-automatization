@@ -14,7 +14,7 @@ import { desc, eq } from "drizzle-orm";
 import type Anthropic from "@anthropic-ai/sdk";
 import { db } from "@/db";
 import { accounts, clips, contentProfiles } from "@/db/schema";
-import { anthropic } from "@/lib/anthropic";
+import { subscriptionMessagesCreate } from "@/lib/claude-subscription";
 import { MODELS } from "@/lib/env";
 import {
   hasCaptions,
@@ -180,7 +180,7 @@ async function proposeQueries(
     .map((r) => r.title)
     .filter(Boolean);
 
-  const response = await anthropic().messages.create({
+  const response = await subscriptionMessagesCreate({
     model: MODELS.strategy,
     max_tokens: 2000,
     system:
@@ -236,7 +236,7 @@ async function rankCandidates(
   const account = db.select().from(accounts).where(eq(accounts.id, accountId)).get();
   if (!account) throw new Error(`No account ${accountId}`);
 
-  const response = await anthropic().messages.create({
+  const response = await subscriptionMessagesCreate({
     model: MODELS.strategy,
     max_tokens: 3000,
     system:

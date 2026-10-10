@@ -3,6 +3,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { db } from "@/db";
 import { agentMemory, chatMessages, clips } from "@/db/schema";
 import { anthropic } from "@/lib/anthropic";
+import { subscriptionMessagesCreate } from "@/lib/claude-subscription";
 import { env, MODELS } from "@/lib/env";
 import {
   clearTranscriptFiles,
@@ -606,7 +607,7 @@ async function extractMemories(
     .filter((m) => m.active)
     .map((m) => m.content);
 
-  const response = await anthropic().messages.create({
+  const response = await subscriptionMessagesCreate({
     model: MODELS.chat,
     max_tokens: 2000,
     system:
