@@ -87,7 +87,7 @@ export const LowerThird: React.FC<{
   holdSec: number;
 }> = ({ text, sub, accent, atSec, holdSec }) => {
   const frame = useCurrentFrame();
-  const { fps } = useVideoConfig();
+  const { fps, width, height } = useVideoConfig();
 
   const startF = atSec * fps;
   const outF = startF + holdSec * fps;
@@ -109,7 +109,8 @@ export const LowerThird: React.FC<{
     <div
       style={{
         position: "absolute",
-        bottom: 560,
+        // Clear of the caption band when vertical; a normal lower third when wide.
+        bottom: height > width ? 560 : 110,
         left: 70,
         opacity,
         transform: `translateX(${x}px)`,

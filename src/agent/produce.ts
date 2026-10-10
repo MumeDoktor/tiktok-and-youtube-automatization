@@ -69,7 +69,7 @@ const DECIDE_TOOL: Anthropic.Tool = {
 };
 
 /** What the footage archive can show, which depends on whether DVIDS is configured. */
-function archiveReach(): string {
+export function archiveReach(): string {
   return env.dvidsApiKey
     ? "archive: public-domain US military footage - DVIDS (modern DoD video of aircraft, units " +
         "and exercises) plus the Internet Archive's mid-century films."

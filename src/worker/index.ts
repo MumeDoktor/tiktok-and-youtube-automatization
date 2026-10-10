@@ -25,6 +25,7 @@ import { fixedSlots, hourLabel, planAutopilot, readAutopilotPayload } from "../a
 import { publishClip, reportPublishGaveUp, type PublishPayload } from "../agent/publish";
 import { handoffClipToClaude } from "../lib/claude-handoff";
 import { makeVideo } from "../agent/make";
+import { makeLongVideo } from "../agent/long";
 import { aeEditorDir, useAeEditor } from "../lib/ae-editor";
 import { pollTelegram, telegramStatus } from "../agent/telegram-review";
 import { reviseInAe, type RevisePayload } from "../agent/revise";
@@ -131,6 +132,9 @@ async function runJob(job: JobRow) {
       return;
     case "make_video":
       await makeVideo(accountId);
+      return;
+    case "make_long":
+      await makeLongVideo(accountId, JSON.parse(job.payload) as { topic?: string | null; clipId?: string });
       return;
     case "post_now":
       // Always the direct, verified phone driver - an approval means post it

@@ -22,6 +22,7 @@ import { enqueue } from "./events";
 import { approveClip, rejectClip } from "./make";
 import { rememberRejection } from "./revise";
 import { approveReply, skipReply } from "./comments";
+import { isLongForm } from "./long";
 
 /**
  * Review from the phone: a finished export arrives in Telegram as the video,
@@ -140,7 +141,9 @@ async function handle(u: Update) {
       result = rejectClip(clipId);
       if (result.startsWith("rejected")) {
         icon = "❌";
-        askWhy(clipId);
+        // The fix / make-another flow re-edits in After Effects and queues a
+        // TikTok video; neither applies to a long-form one.
+        if (!isLongForm(clipId)) askWhy(clipId);
       }
     } else if (action === "creply" || action === "cskip") {
       // A drafted comment reply: clipId here is the comment's id.

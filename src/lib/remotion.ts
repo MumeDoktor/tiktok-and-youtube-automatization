@@ -54,6 +54,8 @@ export type RenderOptions = {
   /** Sound effects to place, as local files. Staged like any other asset. */
   sfx?: Array<{ path: string; atMs: number; gain: number }>;
   look: Look;
+  /** Render 1920x1080 instead of the vertical frame (long-form YouTube). */
+  wide?: boolean;
 };
 
 function run(args: string[], cwd: string, timeoutMs: number): Promise<string> {
@@ -204,7 +206,7 @@ export async function renderClip(id: string, opts: RenderOptions): Promise<strin
         "remotion",
         "render",
         "src/index.ts",
-        "Clip",
+        opts.wide ? "ClipWide" : "Clip",
         output,
         `--props=${propsFile}`,
         // Without an explicit codec the audio track is dropped on some

@@ -395,6 +395,7 @@ export const jobs = sqliteTable(
         "post_now",
         "check_comments",
         "reply_comments",
+        "make_long",
       ],
     }).notNull(),
     /** JSON payload */

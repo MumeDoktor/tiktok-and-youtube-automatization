@@ -115,7 +115,9 @@ export type JobType =
   /** Read the comments on the newest posts and draft replies (comments.ts). */
   | "check_comments"
   /** Send the replies that were approved, through the phone. */
-  | "reply_comments";
+  | "reply_comments"
+  /** An 8-12 minute 16:9 documentary for YouTube, chapter by chapter (long.ts). */
+  | "make_long";
 
 /** Enqueue a unit of pipeline work for the worker to pick up. */
 export function enqueue(args: {

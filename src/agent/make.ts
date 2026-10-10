@@ -4,6 +4,7 @@ import { accounts, clips, settings } from "@/db/schema";
 import { approvedKey, isApproved } from "./approval";
 import { enqueue, logEvent, noteProgress } from "./events";
 import { libraryDir, libraryShare, makeLibraryClip } from "./library";
+import { isLongForm, longDir } from "./long";
 import { produceNext, reportProduced } from "./produce";
 
 /**
@@ -50,6 +51,16 @@ export function approveClip(clipId: string): string {
   if (clip.status === "posted") return "already posted";
   if (!["review_in_ae", "ready"].includes(clip.status)) {
     throw new Error(`Clip ${clipId} is "${clip.status}" - only a clip waiting for review can be approved`);
+  }
+  // A long-form video is for YouTube. Approving it records the OK and stops:
+  // it must never reach the phone, which only posts to TikTok.
+  if (isLongForm(clipId)) {
+    if (clip.status !== "ready") throw new Error(`Clip ${clipId} is "${clip.status}" - it is not finished yet`);
+    if (isApproved(clipId)) return "already approved - kept for YouTube";
+    db.insert(settings).values({ key: approvedKey(clipId), value: String(Date.now()) }).run();
+    noteProgress(clipId, `Approved by the owner - kept for YouTube. Title, description and subtitles: ${longDir(clipId)}`);
+    logEvent({ accountId: clip.accountId, type: "clip.approved", message: `Approved for YouTube: ${clip.hookText ?? clipId}` });
+    return "approved - kept for YouTube (upload is not connected yet)";
   }
   // A second tap (or a second `npm run approve`) must not queue a second post.
   if (isApproved(clipId)) return "already approved - it is on its way";

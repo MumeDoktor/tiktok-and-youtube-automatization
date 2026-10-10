@@ -54,7 +54,16 @@ async def main() -> None:
 
     for index, line in enumerate(job["lines"]):
         out_path = job["files"][index]
-        words = await speak_line(line["text"], voice, rate, out_path)
+        # The service refuses a handshake now and then (HTTP 403) and accepts the
+        # next one. One refused line used to cost the whole narration.
+        for attempt in range(5):
+            try:
+                words = await speak_line(line["text"], voice, rate, out_path)
+                break
+            except Exception:
+                if attempt == 4:
+                    raise
+                await asyncio.sleep(2 + attempt * 4)
         results.append({"index": index, "file": out_path, "words": words})
 
     json.dump({"lines": results}, sys.stdout)
