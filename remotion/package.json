@@ -10,12 +10,17 @@
   "dependencies": {
     "@remotion/cli": "4.0.457",
     "@remotion/google-fonts": "4.0.457",
+    "d3-geo": "^3.1.1",
     "react": "18.3.1",
     "react-dom": "18.3.1",
-    "remotion": "4.0.457"
+    "remotion": "4.0.457",
+    "topojson-client": "^3.1.0",
+    "world-atlas": "^2.0.2"
   },
   "devDependencies": {
+    "@types/d3-geo": "^3.1.1",
     "@types/react": "18.3.12",
+    "@types/topojson-client": "^3.1.5",
     "typescript": "5.9.2"
   }
 }

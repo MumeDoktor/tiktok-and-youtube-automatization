@@ -236,3 +236,91 @@ export async function renderClip(id: string, opts: RenderOptions): Promise<strin
   }
   return output;
 }
+
+/** One scene of a sourced story. Mirrors remotion/src/Story.tsx. */
+export type StoryPlace = { name: string; lat: number; lon: number };
+export type StoryScene = {
+  startMs: number;
+  endMs: number;
+  kind: "title" | "photo" | "map" | "quote" | "number" | "fact";
+  /** A local picture: the photograph itself, or the dimmed backdrop of a card. */
+  path?: string;
+  caption?: string;
+  credit?: string;
+  text?: string;
+  sub?: string;
+  source?: string;
+  from?: StoryPlace;
+  to?: StoryPlace;
+  point?: StoryPlace;
+  progress?: number;
+};
+
+/**
+ * Renders photographs, maps and cards timed to a narration, in 1920x1080.
+ *
+ * The same staging as renderClip: pictures are linked into remotion/public for
+ * the length of the render and removed afterwards.
+ */
+export async function renderStory(
+  id: string,
+  opts: { scenes: StoryScene[]; voicePath?: string; durationMs: number; accent?: string },
+): Promise<string> {
+  if (!remotionAvailable()) {
+    throw new Error('Remotion is not installed. Run "npm install" inside the remotion/ directory.');
+  }
+  if (opts.scenes.length === 0) throw new Error("No scenes given to render.");
+
+  fs.mkdirSync(outDir, { recursive: true });
+  const output = path.join(outDir, `${id}.mp4`);
+  const publicDir = path.join(remotionDir, "public");
+  fs.mkdirSync(publicDir, { recursive: true });
+  const stagedPaths: string[] = [];
+
+  // A photograph is usually shown more than once; each file is staged once.
+  const names = new Map<string, string>();
+  const scenes = opts.scenes.map(({ path: file, ...scene }) => {
+    if (!file || !fs.existsSync(file)) return scene;
+    let name = names.get(file);
+    if (!name) {
+      name = `${id}-p${names.size}${path.extname(file) || ".jpg"}`;
+      stagedPaths.push(stage(publicDir, file, name));
+      names.set(file, name);
+    }
+    return { ...scene, file: name };
+  });
+
+  let voiceFile: string | undefined;
+  if (opts.voicePath && fs.existsSync(opts.voicePath)) {
+    voiceFile = `${id}-voice${path.extname(opts.voicePath) || ".mp3"}`;
+    stagedPaths.push(stage(publicDir, opts.voicePath, voiceFile));
+  }
+
+  const propsFile = path.join(remotionDir, `.props-${id}.json`);
+  fs.writeFileSync(
+    propsFile,
+    JSON.stringify({ scenes, voiceFile, durationMs: opts.durationMs, accent: opts.accent ?? "#E0A526" }),
+    "utf8",
+  );
+
+  try {
+    await run(
+      ["remotion", "render", "src/index.ts", "Story", output, `--props=${propsFile}`, "--audio-codec=aac", "--log=error"],
+      remotionDir,
+      40 * 60_000,
+    );
+  } finally {
+    for (const temp of [propsFile, ...stagedPaths]) {
+      try {
+        fs.unlinkSync(temp);
+      } catch {
+        // Leftovers here are harmless.
+      }
+    }
+  }
+
+  if (!fs.existsSync(output) || fs.statSync(output).size < 10_000) {
+    throw new Error("Remotion finished but produced no usable file.");
+  }
+  return output;
+}

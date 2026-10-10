@@ -1,6 +1,7 @@
 import React from "react";
 import { Composition } from "remotion";
 import { Clip } from "./Clip";
+import { Story, type StoryProps } from "./Story";
 import type { ClipProps } from "./types";
 
 const FPS = 30;
@@ -65,6 +66,19 @@ export const RemotionRoot: React.FC = () => {
         height={1080}
         defaultProps={DEFAULTS}
         calculateMetadata={lengthFromProps}
+      />
+      {/* A sourced story: photographs, maps and cards timed to the narration. */}
+      <Composition
+        id="Story"
+        component={Story}
+        durationInFrames={30 * FPS}
+        fps={FPS}
+        width={1920}
+        height={1080}
+        defaultProps={{ scenes: [], durationMs: 30_000, accent: "#E0A526" } as StoryProps}
+        calculateMetadata={({ props }) => ({
+          durationInFrames: Math.max(30, Math.round(((props as StoryProps).durationMs / 1000) * FPS)),
+        })}
       />
     </>
   );

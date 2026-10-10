@@ -6,10 +6,10 @@
  *
  * It ends at review in After Effects. Look at it, then: npm run approve -- <clipId>
  *
- * A long-form (8-12 minute, 16:9) video for YouTube instead:
+ * A long-form (12-16 minute, 16:9) aviation-accident documentary for YouTube instead:
  *
- *   npm run make -- norex055 --long                      the agent picks the story
- *   npm run make -- norex055 --long "the story to tell"  you pick it
+ *   npm run make -- norex055 --long                                 the agent picks the accident
+ *   npm run make -- norex055 --long "British Airways Flight 5390"   you pick it
  *   npm run make -- norex055 --long --resume <clipId>    carry on one that stopped
  */
 import "../worker/load-env";
