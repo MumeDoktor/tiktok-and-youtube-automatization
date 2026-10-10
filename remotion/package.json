@@ -1,0 +1,21 @@
+{
+  "name": "clip-renderer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Isolated Remotion workspace. Own React 18 so it never fights the Next app's React 19.",
+  "scripts": {
+    "studio": "remotion studio",
+    "render": "remotion render"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.457",
+    "@remotion/google-fonts": "4.0.457",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "remotion": "4.0.457"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.12",
+    "typescript": "5.9.2"
+  }
+}
